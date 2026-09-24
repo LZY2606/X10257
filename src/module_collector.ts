@@ -66,7 +66,16 @@ async function collectEditableModules(
       };
     });
 
-  return Promise.all(modules);
+  // Canonicalize the file order at the real entry boundary: the glob result
+  // order (and therefore the resulting map insertion order) must not depend on
+  // filesystem enumeration order. Byte-wise path comparison is locale-free.
+  return (await Promise.all(modules)).sort((a, b) =>
+    a.modulePath < b.modulePath
+      ? -1
+      : a.modulePath > b.modulePath
+        ? 1
+        : 0,
+  );
 }
 
 function validate(relativePath: string): void {

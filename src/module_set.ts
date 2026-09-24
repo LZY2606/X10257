@@ -84,15 +84,26 @@ export class ModuleSet {
       readonly position: number;
     },
   ) {
+    // Version identity of the complete input (module paths + contents).
+    // A cache from another input version is rejected wholesale, so state from
+    // a previous compilation can never leak into the current one.
+    this.contentVersion = computeModuleSetVersion(modulePathToContent);
     this.cache =
       cache !== "no-cache"
-        ? new Cache(modulePathToContent, cache.moduleBundles, cache.registry)
+        ? cache.contentVersion === this.contentVersion
+          ? new Cache(modulePathToContent, cache.moduleBundles, cache.registry)
+          : undefined
         : undefined;
     // In completion mode, no need to recompile modules which are not dependencies of
     // the current module.
     const modulePaths = completionMode
       ? [completionMode.modulePath]
-      : modulePathToContent.keys();
+      : // Canonical traversal order: iteration over a map follows insertion
+        // order, which itself depends on the order files were discovered in
+        // (e.g. glob order). Sorting module paths makes registry merges,
+        // cross-file duplicate-number diagnostics and final output order
+        // independent of file input ordering.
+        [...modulePathToContent.keys()].sort(compareModulePaths);
     for (const modulePath of modulePaths) {
       this.parseAndResolve(modulePath, new Set<string>());
     }
@@ -914,7 +925,13 @@ export class ModuleSet {
     };
     const modules = new Map<string, MutableModuleResult>();
 
-    for (const [modulePath, moduleBundle] of this.moduleBundles) {
+    // Build the per-module result map in canonical (sorted) module path order.
+    // This is the map generators iterate, so the emitted file/module order no
+    // longer depends on the order files happened to be discovered in.
+    for (const modulePath of [...this.moduleBundles.keys()].sort(
+      compareModulePaths,
+    )) {
+      const moduleBundle = this.moduleBundles.get(modulePath)!;
       const { module, tokens } = moduleBundle;
       const moduleErrors = tokens.errors.length ? tokens.errors : module.errors;
       modules.set(modulePath, {
@@ -929,6 +946,9 @@ export class ModuleSet {
       if (methods.length <= 1) {
         continue;
       }
+      // Canonical identity for the conflicting methods, independent of the
+      // order modules were merged in: sort by (module path, name, position).
+      const orderedMethods = [...methods].sort(compareMethodLocations);
       const pushError = (method: Method, other: Method): void => {
         const modulePath = method.name.line.modulePath;
         const moduleResult = modules.get(modulePath)!;
@@ -939,9 +959,14 @@ export class ModuleSet {
           message: `Same number as ${otherMethodName} in ${otherModulePath}`,
         });
       };
-      pushError(methods[0]!, methods[1]!);
-      for (let i = 1; i < methods.length; ++i) {
-        pushError(methods[i]!, methods[0]!);
+      const first = orderedMethods[0]!;
+      const last = orderedMethods[orderedMethods.length - 1]!;
+      // The canonical (first) declaration is reported against the last one,
+      // every other declaration is reported against the first one. Either
+      // direction is unambiguous because the ordering is total and canonical.
+      pushError(first, last);
+      for (let i = 1; i < orderedMethods.length; ++i) {
+        pushError(orderedMethods[i]!, first);
       }
     }
 
@@ -950,6 +975,14 @@ export class ModuleSet {
       if (records.length <= 1) {
         continue;
       }
+      // Canonical identity for the conflicting records, independent of the
+      // order modules were merged in: sort by (module path, name, position).
+      const orderedKeys = [...records].sort((a, b) =>
+        compareRecordLocations(
+          this.registry.recordMap.get(a)!,
+          this.registry.recordMap.get(b)!,
+        ),
+      );
       const pushError = (recordKey: RecordKey, otherKey: RecordKey): void => {
         const record = this.registry.recordMap.get(recordKey)!;
         const other = this.registry.recordMap.get(otherKey)!;
@@ -963,19 +996,28 @@ export class ModuleSet {
           message: `Same number as ${otherRecordName} in ${otherModulePath}`,
         });
       };
-      pushError(records[0]!, records[1]!);
-      for (let i = 1; i < records.length; ++i) {
-        pushError(records[i]!, records[0]!);
+      const firstKey = orderedKeys[0]!;
+      const lastKey = orderedKeys[orderedKeys.length - 1]!;
+      pushError(firstKey, lastKey);
+      for (let i = 1; i < orderedKeys.length; ++i) {
+        pushError(orderedKeys[i]!, firstKey);
       }
     }
 
     // Aggregate errors across all modules.
     const errors: SkirError[] = [];
     const warnings: SkirError[] = [];
+    // `modules` is already keyed in sorted module path order; sort each
+    // module's errors by source position as well so diagnostics are
+    // deterministic regardless of which phase pushed them, then aggregate.
     for (const moduleBundle of modules.values()) {
+      moduleBundle.errors.sort(compareErrorLocations);
+      moduleBundle.warnings.sort(compareErrorLocations);
       errors.push(...moduleBundle.errors);
       warnings.push(...moduleBundle.warnings);
     }
+    errors.sort(compareErrorLocations);
+    warnings.sort(compareErrorLocations);
     return {
       modules: modules,
       errors: errors,
@@ -989,6 +1031,14 @@ export class ModuleSet {
   private readonly registry = new DeclarationRegistry();
   private readonly finalizationResult: FinalizationResult;
   // END PROPERTIES
+
+  /**
+   * Deterministic identity of the complete module-set input
+   * (sorted module paths + contents). Two compilers with the same model have
+   * the same version; any content or file-set change produces another one.
+   * Used to version the incremental cache across compilations.
+   */
+  readonly contentVersion: string;
 
   findRecordByNumber(recordNumber: number): RecordLocation | undefined {
     const { numberToRecords, recordMap } = this.registry;
@@ -1323,6 +1373,96 @@ type ModuleCacheResult =
       kind: "module-bundle";
       bundle: ModuleBundle;
     };
+
+/**
+ * Canonical ordering for module paths: plain byte-wise comparison.
+ * `localeCompare` would depend on the ICU/locale data of the machine, which
+ * must not influence generated artifacts.
+ */
+function compareModulePaths(pathA: string, pathB: string): number {
+  return pathA < pathB ? -1 : pathA > pathB ? 1 : 0;
+}
+
+/** Total, canonical ordering of error tokens (module, position). */
+function compareErrorLocations(a: SkirError, b: SkirError): number {
+  const moduleCmp = compareModulePaths(
+    a.token.line.modulePath,
+    b.token.line.modulePath,
+  );
+  if (moduleCmp !== 0) {
+    return moduleCmp;
+  }
+  if (a.token.position !== b.token.position) {
+    return a.token.position - b.token.position;
+  }
+  // Stable tie-breaker for errors attached to the same token.
+  const messageA = a.expected !== undefined ? a.expected : a.message;
+  const messageB = b.expected !== undefined ? b.expected : b.message;
+  return messageA < messageB ? -1 : messageA > messageB ? 1 : 0;
+}
+
+/** Total, canonical ordering of method declarations. */
+function compareMethodLocations(a: Method, b: Method): number {
+  const moduleCmp = compareModulePaths(
+    a.name.line.modulePath,
+    b.name.line.modulePath,
+  );
+  if (moduleCmp !== 0) {
+    return moduleCmp;
+  }
+  if (a.name.position !== b.name.position) {
+    return a.name.position - b.name.position;
+  }
+  return a.name.text < b.name.text ? -1 : a.name.text > b.name.text ? 1 : 0;
+}
+
+/** Total, canonical ordering of record locations. */
+function compareRecordLocations(
+  a: RecordLocation,
+  b: RecordLocation,
+): number {
+  const moduleCmp = compareModulePaths(a.modulePath, b.modulePath);
+  if (moduleCmp !== 0) {
+    return moduleCmp;
+  }
+  if (a.record.name.position !== b.record.name.position) {
+    return a.record.name.position - b.record.name.position;
+  }
+  const nameA = a.record.name.text;
+  const nameB = b.record.name.text;
+  return nameA < nameB ? -1 : nameA > nameB ? 1 : 0;
+}
+
+/**
+ * FNV-1a 64-bit hash, folded into a JS number with modular multiplication.
+ * Not cryptographic; only used as a deterministic version identity.
+ */
+function hashString(input: string, seed = 0xcbf29ce484222325n): bigint {
+  let hash = seed;
+  for (let i = 0; i < input.length; ++i) {
+    hash ^= BigInt(input.charCodeAt(i));
+    hash = (hash * 0x100000001b3n) & 0xffffffffffffffffn;
+  }
+  return hash;
+}
+
+/**
+ * Deterministic version identity of a complete module-set input.
+ * Paths are hashed in sorted order, preceded by their length, so a change in
+ * file set, file path or file content all change the version.
+ */
+function computeModuleSetVersion(
+  modulePathToContent: ReadonlyMap<string, string>,
+): string {
+  const paths = [...modulePathToContent.keys()].sort(compareModulePaths);
+  let hash = 0xcbf29ce484222325n;
+  for (const path of paths) {
+    hash = hashString(`${path.length}:${path}`, hash);
+    const content = modulePathToContent.get(path)!;
+    hash = hashString(`${content.length}:${content}`, hash);
+  }
+  return `v1-${hash.toString(16).padStart(16, "0")}`;
+}
 
 class Cache {
   private readonly modulePathToCacheResult = new Map<
