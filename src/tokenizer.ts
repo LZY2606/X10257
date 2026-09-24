@@ -255,7 +255,10 @@ class Lines {
     const lines = this.lines;
     let lineStart = 0;
     let group: RegExpExecArray | null;
-    const re = /\n|\r|\n\r|$/g;
+    // CR+LF (Windows) and the rare LF+CR must be matched as a single line
+    // break before the individual alternatives, otherwise a CRLF produces a
+    // phantom empty line and shifts every subsequent line number by one.
+    const re = /\r\n|\n\r|\n|\r|$/g;
     while ((group = re.exec(code)) !== null) {
       const match = group[0];
       const lineEnd = re.lastIndex - match.length;

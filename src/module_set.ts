@@ -40,6 +40,20 @@ import { extractPackagePrefix, parseModule } from "./parser.js";
 import { ModuleTokens, tokenizeModule } from "./tokenizer.js";
 
 /**
+ * Identity of the cache produced by this build of the compiler.
+ *
+ * Any reuse of a previous `ModuleSet` (incremental compilation in watch mode,
+ * completion requests) is only valid when the producing compilation used the
+ * exact same parser/tokenizer/linker semantics. Bumping this constant
+ * invalidates every stale cache in the same process instead of silently
+ * reusing bundles computed by older code.
+ *
+ * Keep in sync manually with any change to tokenizer, parser, type resolution
+ * or registry semantics.
+ */
+export const MODULE_SET_CACHE_VERSION = 1;
+
+/**
  * Result of compiling a set of modules. Immutable.
  *
  * Support incremental compilation by accepting an optional cache of the previous
@@ -71,8 +85,30 @@ export class ModuleSet {
     return moduleSet.modules.get(currentModulePath)!;
   }
 
-  static empty(): ModuleSet {
+ static empty(): ModuleSet {
     return ModuleSet.compile(new Map(), "no-cache", "strict");
+  }
+
+  /**
+   * Returns true when bundles of `previous` may be reused by a compilation
+   * with the given identity. Exposed (package-internal style) so the cache
+   * machinery can reason about two ModuleSet instances without exposing the
+   * private identity fields.
+   */
+  static hasCompatibleCacheIdentity(
+    previous: ModuleSet,
+    next: {
+      readonly cacheVersion: number;
+      readonly parseMode: "strict" | "lenient";
+      readonly completionMode: boolean;
+    },
+  ): boolean {
+    const previousIdentity = previous.cacheIdentity;
+    return (
+      previousIdentity.cacheVersion === next.cacheVersion &&
+      previousIdentity.parseMode === next.parseMode &&
+      previousIdentity.completionMode === next.completionMode
+    );
   }
 
   constructor(
@@ -84,8 +120,14 @@ export class ModuleSet {
       readonly position: number;
     },
   ) {
+    this.cacheIdentity = {
+      cacheVersion: MODULE_SET_CACHE_VERSION,
+      parseMode: parseMode,
+      completionMode: completionMode !== undefined,
+    };
     this.cache =
-      cache !== "no-cache"
+      cache !== "no-cache" &&
+      ModuleSet.hasCompatibleCacheIdentity(cache, this.cacheIdentity)
         ? new Cache(modulePathToContent, cache.moduleBundles, cache.registry)
         : undefined;
     // In completion mode, no need to recompile modules which are not dependencies of
@@ -985,6 +1027,7 @@ export class ModuleSet {
 
   // BEGIN PROPERTIES
   private cache: Cache | undefined;
+  private readonly cacheIdentity: CacheIdentity;
   private readonly moduleBundles = new Map<string, ModuleBundle>();
   private readonly registry = new DeclarationRegistry();
   private readonly finalizationResult: FinalizationResult;
@@ -1383,6 +1426,12 @@ class Cache {
   getModuleCacheResult(modulePath: string): ModuleCacheResult {
     return this.modulePathToCacheResult.get(modulePath) ?? { kind: "no-cache" };
   }
+}
+
+interface CacheIdentity {
+  readonly cacheVersion: number;
+  readonly parseMode: "strict" | "lenient";
+  readonly completionMode: boolean;
 }
 
 /** Registry of declarations possibly across multiple modules. */

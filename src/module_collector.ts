@@ -66,7 +66,14 @@ async function collectEditableModules(
       };
     });
 
-  return Promise.all(modules);
+  const editableModulesResult = await Promise.all(modules);
+  // Sort by module path so that compilation (and therefore registry insertion
+  // order, error aggregation order and the `modules` array handed to code
+  // generators) does not depend on the order in which the file system / glob
+  // happened to enumerate the input files.
+  return editableModulesResult
+    .slice()
+    .sort((a, b) => a.modulePath.localeCompare(b.modulePath, "en-US"));
 }
 
 function validate(relativePath: string): void {
