@@ -92,7 +92,11 @@ export class ModuleSet {
     // the current module.
     const modulePaths = completionMode
       ? [completionMode.modulePath]
-      : modulePathToContent.keys();
+      : // Sort the module paths so that the compilation result (module order,
+        // registry insertion order, error order) does not depend on the
+        // insertion order of `modulePathToContent`. The default string sort is
+        // a pure code-unit comparison, stable across machines and locales.
+        [...modulePathToContent.keys()].sort();
     for (const modulePath of modulePaths) {
       this.parseAndResolve(modulePath, new Set<string>());
     }
@@ -914,7 +918,12 @@ export class ModuleSet {
     };
     const modules = new Map<string, MutableModuleResult>();
 
-    for (const [modulePath, moduleBundle] of this.moduleBundles) {
+    // Iterate the modules in sorted path order so that the `modules` map
+    // exposed to callers (and forwarded to code generators) has a canonical
+    // order which does not depend on the order in which modules were
+    // discovered (import graph traversal order).
+    for (const modulePath of [...this.moduleBundles.keys()].sort()) {
+      const moduleBundle = this.moduleBundles.get(modulePath)!;
       const { module, tokens } = moduleBundle;
       const moduleErrors = tokens.errors.length ? tokens.errors : module.errors;
       modules.set(modulePath, {
