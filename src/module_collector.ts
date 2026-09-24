@@ -66,7 +66,13 @@ async function collectEditableModules(
       };
     });
 
-  return Promise.all(modules);
+  const editableModules = await Promise.all(modules);
+  // Sort by module path so that the compilation (and therefore the order of
+  // modules, records and aggregated errors) does not depend on the order in
+  // which the file system enumerates files.
+  return [...editableModules].sort((a, b) =>
+    a.modulePath < b.modulePath ? -1 : a.modulePath > b.modulePath ? 1 : 0,
+  );
 }
 
 function validate(relativePath: string): void {
