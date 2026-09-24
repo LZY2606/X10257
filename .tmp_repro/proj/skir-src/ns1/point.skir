@@ -1,0 +1,5 @@
+/// Point doc
+struct Point {
+  x: int32;
+  y: int32;
+}

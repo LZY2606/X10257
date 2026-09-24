@@ -1,0 +1,2 @@
+import Point2 from "./ns2/point.skir";
+struct Box { p1: Point; p2: Point2; }

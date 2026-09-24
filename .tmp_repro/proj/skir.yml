@@ -1,0 +1,8 @@
+generators:
+  - mod: skir-typescript-gen
+    outDir: ./skirout
+    config: {}
+  - mod: skir-python-gen
+    outDir: ./skirout
+    config: {}
+dependencies: {}
