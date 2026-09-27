@@ -51,6 +51,9 @@ async function collectEditableModules(
 
   const modules = skirFiles
     .filter((skirFile) => skirFile.isFile)
+    .sort((a, b) =>
+      a.fullpath() < b.fullpath() ? -1 : a.fullpath() > b.fullpath() ? 1 : 0,
+    )
     .map(async (skirFile): Promise<EditableModule> => {
       const fullPath = skirFile.fullpath();
       const relativePath = Paths.relative(srcDir, fullPath).replace(/\\/g, "/");

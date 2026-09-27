@@ -47,6 +47,8 @@ import { ModuleTokens, tokenizeModule } from "./tokenizer.js";
  * modules that haven't changed since the last compilation.
  */
 export class ModuleSet {
+  static readonly CACHE_VERSION = 1;
+
   static compile(
     modulePathToContent: ReadonlyMap<string, string>,
     cache: ModuleSet | "no-cache",
@@ -85,15 +87,20 @@ export class ModuleSet {
     },
   ) {
     this.cache =
-      cache !== "no-cache"
-        ? new Cache(modulePathToContent, cache.moduleBundles, cache.registry)
+      cache !== "no-cache" &&
+      (cache as unknown as { cacheVersion?: number }).cacheVersion ===
+        ModuleSet.CACHE_VERSION
+        ? new Cache(modulePathToContent, cache.moduleBundles)
         : undefined;
+    if (this.cache) {
+      this.registry = this.cache.registry;
+    }
     // In completion mode, no need to recompile modules which are not dependencies of
     // the current module.
     const modulePaths = completionMode
       ? [completionMode.modulePath]
       : modulePathToContent.keys();
-    for (const modulePath of modulePaths) {
+    for (const modulePath of canonicalizeModulePaths(modulePaths)) {
       this.parseAndResolve(modulePath, new Set<string>());
     }
     this.finalizationResult = this.finalize();
@@ -150,7 +157,7 @@ export class ModuleSet {
           break;
         }
         case "module-bundle": {
-          this.registry.mergeFrom(moduleCacheResult.bundle.registry);
+          this.moduleBundles.set(modulePath, moduleCacheResult.bundle);
           return moduleCacheResult.bundle;
         }
       }
@@ -914,7 +921,10 @@ export class ModuleSet {
     };
     const modules = new Map<string, MutableModuleResult>();
 
-    for (const [modulePath, moduleBundle] of this.moduleBundles) {
+    const moduleBundles = [...this.moduleBundles.entries()].sort(([a], [b]) =>
+      compareModulePaths(a, b),
+    );
+    for (const [modulePath, moduleBundle] of moduleBundles) {
       const { module, tokens } = moduleBundle;
       const moduleErrors = tokens.errors.length ? tokens.errors : module.errors;
       modules.set(modulePath, {
@@ -926,6 +936,7 @@ export class ModuleSet {
 
     // Look for duplicate method numbers.
     for (const methods of this.registry.numberToMethods.values()) {
+      methods.sort((a, b) => compareTokenLocations(a.name, b.name));
       if (methods.length <= 1) {
         continue;
       }
@@ -947,6 +958,7 @@ export class ModuleSet {
 
     // Look for duplicate record numbers.
     for (const records of this.registry.numberToRecords.values()) {
+      records.sort(compareRecordKeys);
       if (records.length <= 1) {
         continue;
       }
@@ -972,7 +984,8 @@ export class ModuleSet {
     // Aggregate errors across all modules.
     const errors: SkirError[] = [];
     const warnings: SkirError[] = [];
-    for (const moduleBundle of modules.values()) {
+    for (const modulePath of [...modules.keys()].sort(compareModulePaths)) {
+      const moduleBundle = modules.get(modulePath)!;
       errors.push(...moduleBundle.errors);
       warnings.push(...moduleBundle.warnings);
     }
@@ -985,8 +998,9 @@ export class ModuleSet {
 
   // BEGIN PROPERTIES
   private cache: Cache | undefined;
+  private readonly cacheVersion = ModuleSet.CACHE_VERSION;
   private readonly moduleBundles = new Map<string, ModuleBundle>();
-  private readonly registry = new DeclarationRegistry();
+  private registry = new DeclarationRegistry();
   private readonly finalizationResult: FinalizationResult;
   // END PROPERTIES
 
@@ -1017,6 +1031,7 @@ export class ModuleSet {
   get modules(): ReadonlyMap<string, Result<Module>> {
     return this.finalizationResult.modules;
   }
+
 }
 
 /**
@@ -1311,6 +1326,37 @@ class TypeResolver {
   }
 }
 
+function canonicalizeModulePaths(
+  modulePaths: Iterable<string>,
+): string[] {
+  return [...new Set(modulePaths)].sort(compareModulePaths);
+}
+
+function compareModulePaths(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function compareTokenLocations(a: Token, b: Token): number {
+  return (
+    compareModulePaths(a.line.modulePath, b.line.modulePath) ||
+    a.position - b.position
+  );
+}
+
+function compareRecordKeys(a: RecordKey, b: RecordKey): number {
+  const [modulePathA, locationA] = splitRecordKey(a);
+  const [modulePathB, locationB] = splitRecordKey(b);
+  return (
+    compareModulePaths(modulePathA, modulePathB) ||
+    compareModulePaths(locationA, locationB)
+  );
+}
+
+function splitRecordKey(key: RecordKey): [string, string] {
+  const separator = key.indexOf(":");
+  return [key.slice(0, separator), key.slice(separator + 1)];
+}
+
 type ModuleCacheResult =
   | {
       kind: "no-cache";
@@ -1333,7 +1379,7 @@ class Cache {
   constructor(
     modulePathToNewContent: ReadonlyMap<string, string | ModuleTokens>,
     modulePathToOldBundle: ReadonlyMap<string, ModuleBundle>,
-    readonly registry: DeclarationRegistry,
+    readonly registry: DeclarationRegistry = new DeclarationRegistry(),
   ) {
     const unchangedModulePaths = new Set<string>();
     for (const [modulePath, newContent] of modulePathToNewContent) {
@@ -1375,8 +1421,15 @@ class Cache {
       this.modulePathToCacheResult.set(modulePath, result);
       return result;
     };
-    for (const modulePath of modulePathToOldBundle.keys()) {
-      classify(modulePath);
+    for (const modulePath of canonicalizeModulePaths(
+      modulePathToNewContent.keys(),
+    )) {
+      if (classify(modulePath).kind === "module-bundle") {
+        const result = this.modulePathToCacheResult.get(modulePath)!;
+        if (result.kind === "module-bundle") {
+          this.registry.mergeFrom(result.bundle.registry);
+        }
+      }
     }
   }
 

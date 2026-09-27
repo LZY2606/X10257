@@ -32,6 +32,7 @@ export function tokenizeModule(
 ): Result<ModuleTokens> {
   const tokens: Token[] = [];
   const errors: SkirError[] = [];
+  sourceCode = sourceCode.replace(/\r\n|\r/g, "\n");
 
   const lines = new Lines(sourceCode, modulePath);
 
@@ -255,7 +256,7 @@ class Lines {
     const lines = this.lines;
     let lineStart = 0;
     let group: RegExpExecArray | null;
-    const re = /\n|\r|\n\r|$/g;
+    const re = /\r\n|\n|\r|$/g;
     while ((group = re.exec(code)) !== null) {
       const match = group[0];
       const lineEnd = re.lastIndex - match.length;

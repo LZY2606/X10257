@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import * as FileSystem from "fs/promises";
-import { glob } from "glob";
+import { randomUUID } from "node:crypto";
 import * as Paths from "path";
 import type { CodeGenerator } from "skir-internal";
 import Watcher from "watcher";
@@ -135,7 +135,6 @@ class WatchModeMainLoop {
           this.previousModuleSet,
           "strict",
         );
-        this.previousModuleSet = moduleSet;
       } catch (e) {
         if (this.mode === "watch" && e instanceof Error) {
           console.error(makeRed(e.message));
@@ -154,6 +153,7 @@ class WatchModeMainLoop {
           console.error(makeRed("No skir modules found in source directory"));
         }
         await this.doGenerate(moduleSet);
+        this.previousModuleSet = moduleSet;
         if (this.mode === "watch") {
           const date = new Date().toLocaleTimeString("en-US");
           const successMessage = `Generation succeeded at ${date}`;
@@ -177,19 +177,8 @@ class WatchModeMainLoop {
       throw new Error();
     }
 
-    const { skiroutDirs } = this;
-    const preExistingAbsolutePaths = new Set<string>();
-    for (const skiroutDir of skiroutDirs) {
-      await FileSystem.mkdir(skiroutDir, { recursive: true });
-
-      // Collect all the files in all the skirout dirs.
-      (
-        await glob(Paths.join(skiroutDir, "**/*"), { withFileTypes: true })
-      ).forEach((p) => preExistingAbsolutePaths.add(p.fullpath()));
-    }
-
     const pathToFile = new Map<string, CodeGenerator.OutputFile>();
-    const pathToGenerator = new Map<string, GeneratorBundle>();
+    const filesByOutputDir = new Map<string, CodeGenerator.OutputFile[]>();
     for (const generator of this.generatorBundles) {
       const files = generator.generator.generateCode({
         modules: [...moduleSet.modules.values()].map((r) => r.result),
@@ -204,58 +193,30 @@ class WatchModeMainLoop {
           );
         }
         pathToFile.set(path, file);
-        pathToGenerator.set(path, generator);
         for (const skiroutDir of generator.skiroutDirs) {
-          // Remove this path and all its parents from the set of paths to remove
-          // at the end of the generation.
-          for (
-            let pathToKeep = path;
-            pathToKeep !== ".";
-            pathToKeep = Paths.dirname(pathToKeep)
-          ) {
-            preExistingAbsolutePaths.delete(
-              Paths.resolve(Paths.join(skiroutDir, pathToKeep)),
-            );
-          }
+          const outputFiles = filesByOutputDir.get(skiroutDir) ?? [];
+          outputFiles.push(file);
+          filesByOutputDir.set(skiroutDir, outputFiles);
         }
       }
     }
 
-    // Write or override all the generated files.
-    const { lastWriteBatch } = this;
-    await Promise.all(
-      Array.from(pathToFile).map(async ([p, newFile]) => {
-        const oldFile = lastWriteBatch.pathToFile.get(p);
-        const generator = pathToGenerator.get(p)!;
-        for (const skiroutDir of generator.skiroutDirs) {
-          const fsPath = Paths.join(skiroutDir, p);
-          if (oldFile?.code === newFile.code) {
-            const mtime = (await FileSystem.stat(fsPath)).mtime;
-            if (
-              mtime !== null &&
-              mtime.getDate() <= lastWriteBatch.writeTime.getDate()
-            ) {
-              return;
-            }
-          }
-          await FileSystem.mkdir(Paths.dirname(fsPath), { recursive: true });
-          await FileSystem.writeFile(fsPath, newFile.code, "utf-8");
-        }
-      }),
-    );
-
-    // Remove all the pre-existing paths which haven't been overridden.
-    await Promise.all(
-      Array.from(preExistingAbsolutePaths)
-        .sort((a, b) => b.localeCompare(a, "en-US"))
-        .map(async (p) => {
-          try {
-            await FileSystem.rm(p, { force: true, recursive: true });
-          } catch (_e) {
-            // Ignore error.
-          }
-        }),
-    );
+    const stagedOutputs: StagedOutput[] = [];
+    try {
+      for (const [skiroutDir, files] of [...filesByOutputDir].sort(([a], [b]) =>
+        a.localeCompare(b, "en-US"),
+      )) {
+        stagedOutputs.push(await stageOutput(skiroutDir, files));
+      }
+      for (const stagedOutput of stagedOutputs) {
+        await stagedOutput.commit();
+      }
+    } catch (e) {
+      for (const stagedOutput of stagedOutputs) {
+        await stagedOutput.rollback();
+      }
+      throw e;
+    }
 
     this.lastWriteBatch = {
       pathToFile: pathToFile,
@@ -271,6 +232,110 @@ class WatchModeMainLoop {
     pathToFile: new Map(),
     writeTime: new Date(0),
   };
+}
+
+interface StagedOutput {
+  commit(): Promise<void>;
+  rollback(): Promise<void>;
+}
+
+async function stageOutput(
+  skiroutDir: string,
+  files: readonly CodeGenerator.OutputFile[],
+): Promise<StagedOutput> {
+  const parentDir = Paths.dirname(skiroutDir);
+  const outputName = Paths.basename(skiroutDir);
+  const stagingDir = Paths.join(
+    parentDir,
+    `.${outputName}.${randomUUID()}.staging`,
+  );
+  const backupDir = Paths.join(
+    parentDir,
+    `.${outputName}.${randomUUID()}.backup`,
+  );
+
+  await FileSystem.mkdir(stagingDir, { recursive: true });
+  try {
+    await Promise.all(
+      files.map(async (file) => {
+        const relativePath = file.path.replace(/\\/g, "/");
+        const outputPath = Paths.resolve(Paths.join(skiroutDir, relativePath));
+        const relativeFromOutput = Paths.relative(skiroutDir, outputPath);
+        if (
+          relativeFromOutput.startsWith("..") ||
+          Paths.isAbsolute(relativeFromOutput)
+        ) {
+          throw new ExitError(
+            "Generated file escapes output directory: " +
+              rewritePathForRendering(file.path),
+          );
+        }
+        const stagedPath = Paths.join(stagingDir, relativePath);
+        await FileSystem.mkdir(Paths.dirname(stagedPath), {
+          recursive: true,
+        });
+        await FileSystem.writeFile(stagedPath, file.code, "utf-8");
+      }),
+    );
+
+    let hasBackup = false;
+    try {
+      await FileSystem.rename(skiroutDir, backupDir);
+      hasBackup = true;
+    } catch (e) {
+      if (
+        !e ||
+        typeof e !== "object" ||
+        !("code" in e) ||
+        e.code !== "ENOENT"
+      ) {
+        throw e;
+      }
+    }
+
+    let committed = false;
+    return {
+      async commit(): Promise<void> {
+        await FileSystem.rename(stagingDir, skiroutDir);
+        committed = true;
+        if (hasBackup) {
+          await FileSystem.rm(backupDir, { force: true, recursive: true });
+        }
+      },
+      async rollback(): Promise<void> {
+        if (committed) {
+          if (hasBackup) {
+            const failedOutput = Paths.join(
+              parentDir,
+              `.${outputName}.${randomUUID()}.failed`,
+            );
+            await FileSystem.rename(skiroutDir, failedOutput);
+            await FileSystem.rename(backupDir, skiroutDir);
+            await FileSystem.rm(failedOutput, {
+              force: true,
+              recursive: true,
+            });
+          } else {
+            await FileSystem.rm(skiroutDir, {
+              force: true,
+              recursive: true,
+            });
+          }
+        } else {
+          await FileSystem.rm(stagingDir, {
+            force: true,
+            recursive: true,
+          });
+          if (hasBackup) {
+            await FileSystem.rename(backupDir, skiroutDir);
+          }
+        }
+      },
+    };
+  } catch (e) {
+    await FileSystem.rm(stagingDir, { force: true, recursive: true });
+    throw e;
+  }
 }
 
 function checkNoOverlappingSkiroutDirs(skiroutDirs: readonly string[]): void {
