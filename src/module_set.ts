@@ -39,6 +39,8 @@ import {
 import { extractPackagePrefix, parseModule } from "./parser.js";
 import { ModuleTokens, tokenizeModule } from "./tokenizer.js";
 
+const CACHE_IDENTITY_VERSION = 1;
+
 /**
  * Result of compiling a set of modules. Immutable.
  *
@@ -86,7 +88,12 @@ export class ModuleSet {
   ) {
     this.cache =
       cache !== "no-cache"
-        ? new Cache(modulePathToContent, cache.moduleBundles, cache.registry)
+        ? new Cache(
+            modulePathToContent,
+            cache.moduleBundles,
+            this.parseMode,
+            cache.cacheIdentity,
+          )
         : undefined;
     // In completion mode, no need to recompile modules which are not dependencies of
     // the current module.
@@ -914,7 +921,8 @@ export class ModuleSet {
     };
     const modules = new Map<string, MutableModuleResult>();
 
-    for (const [modulePath, moduleBundle] of this.moduleBundles) {
+    for (const modulePath of [...this.moduleBundles.keys()].sort(compareKeys)) {
+      const moduleBundle = this.moduleBundles.get(modulePath)!;
       const { module, tokens } = moduleBundle;
       const moduleErrors = tokens.errors.length ? tokens.errors : module.errors;
       modules.set(modulePath, {
@@ -925,7 +933,17 @@ export class ModuleSet {
     }
 
     // Look for duplicate method numbers.
-    for (const methods of this.registry.numberToMethods.values()) {
+    for (const methods of [
+      ...this.registry.numberToMethods.values(),
+    ].map((sameNumberMethods) =>
+      [...sameNumberMethods].sort((methodA, methodB) =>
+        compareTokens(
+          methodA.name,
+          methodB.name,
+          (token) => token.line.modulePath,
+        ),
+      ),
+    )) {
       if (methods.length <= 1) {
         continue;
       }
@@ -946,7 +964,11 @@ export class ModuleSet {
     }
 
     // Look for duplicate record numbers.
-    for (const records of this.registry.numberToRecords.values()) {
+    for (const records of [
+      ...this.registry.numberToRecords.values(),
+    ].map((sameNumberRecords) =>
+      [...sameNumberRecords].sort(compareRecordKeys),
+    )) {
       if (records.length <= 1) {
         continue;
       }
@@ -972,7 +994,8 @@ export class ModuleSet {
     // Aggregate errors across all modules.
     const errors: SkirError[] = [];
     const warnings: SkirError[] = [];
-    for (const moduleBundle of modules.values()) {
+    for (const modulePath of [...modules.keys()].sort(compareKeys)) {
+      const moduleBundle = modules.get(modulePath)!;
       errors.push(...moduleBundle.errors);
       warnings.push(...moduleBundle.warnings);
     }
@@ -988,6 +1011,7 @@ export class ModuleSet {
   private readonly moduleBundles = new Map<string, ModuleBundle>();
   private readonly registry = new DeclarationRegistry();
   private readonly finalizationResult: FinalizationResult;
+  private readonly cacheIdentity = makeCacheIdentity(parseMode);
   // END PROPERTIES
 
   findRecordByNumber(recordNumber: number): RecordLocation | undefined {
@@ -1333,15 +1357,12 @@ class Cache {
   constructor(
     modulePathToNewContent: ReadonlyMap<string, string | ModuleTokens>,
     modulePathToOldBundle: ReadonlyMap<string, ModuleBundle>,
-    readonly registry: DeclarationRegistry,
+    private readonly parseMode: "strict" | "lenient",
+    private readonly oldCacheIdentity: string,
+    readonly registry: DeclarationRegistry = new DeclarationRegistry(),
   ) {
-    const unchangedModulePaths = new Set<string>();
-    for (const [modulePath, newContent] of modulePathToNewContent) {
-      const oldBundle = modulePathToOldBundle.get(modulePath);
-      if (oldBundle?.tokens.result.sourceCode === newContent) {
-        unchangedModulePaths.add(modulePath);
-      }
-    }
+    const hasCompatibleIdentity =
+      oldCacheIdentity === makeCacheIdentity(parseMode);
     const classify = (modulePath: string): ModuleCacheResult => {
       const oldBundle = modulePathToOldBundle.get(modulePath);
       if (!oldBundle) {
@@ -1355,7 +1376,14 @@ class Cache {
       }
       let result: ModuleCacheResult;
       const newContent = modulePathToNewContent.get(modulePath);
-      if (newContent === oldBundle.tokens.result.sourceCode) {
+      const sourceCode =
+        typeof newContent === "string"
+          ? newContent
+          : newContent?.sourceCode;
+      if (
+        hasCompatibleIdentity &&
+        sourceCode === oldBundle.tokens.result.sourceCode
+      ) {
         // Assume best case, may downgrade later.
         this.modulePathToCacheResult.set(modulePath, {
           kind: "module-bundle",
@@ -1375,8 +1403,28 @@ class Cache {
       this.modulePathToCacheResult.set(modulePath, result);
       return result;
     };
-    for (const modulePath of modulePathToOldBundle.keys()) {
+    for (const modulePath of [...modulePathToOldBundle.keys()].sort(compareKeys)) {
       classify(modulePath);
+    }
+    for (const modulePath of [...this.modulePathToCacheResult.keys()].sort(
+      compareKeys,
+    )) {
+      if (!modulePathToNewContent.has(modulePath)) {
+        continue;
+      }
+      const cacheResult = this.modulePathToCacheResult.get(modulePath)!;
+      if (cacheResult.kind !== "module-bundle") {
+        continue;
+      }
+      for (const [name, locations] of cacheResult.bundle.registry
+        .topLevelNameToRecordLocations) {
+        const existing = registry.topLevelNameToRecordLocations.get(name);
+        if (existing) {
+          existing.push(...locations);
+        } else {
+          registry.topLevelNameToRecordLocations.set(name, [...locations]);
+        }
+      }
     }
   }
 

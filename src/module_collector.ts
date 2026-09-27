@@ -15,18 +15,27 @@ export async function collectModules(
   parseMode: "strict" | "lenient",
 ): Promise<ModuleSet> {
   const modulePathToContent = new Map<string, string>();
-  for (const [modulePath, module] of dependencies.modules) {
-    modulePathToContent.set(modulePath, module.result.sourceCode);
-  }
   const editableModules = await collectEditableModules(srcDir);
   for (const { modulePath, content } of editableModules) {
     modulePathToContent.set(modulePath, content);
   }
+  for (const [modulePath, module] of dependencies.modules) {
+    modulePathToContent.set(modulePath, module.result.sourceCode);
+  }
+  const sortedModulePathToContent = new Map(
+    [...modulePathToContent].sort(([pathA], [pathB]) =>
+      compareModulePaths(pathA, pathB),
+    ),
+  );
   return ModuleSet.compile(
-    modulePathToContent,
+    sortedModulePathToContent,
     cache ?? dependencies,
     parseMode,
   );
+}
+
+export function compareModulePaths(pathA: string, pathB: string): number {
+  return pathA < pathB ? -1 : pathA > pathB ? 1 : 0;
 }
 
 interface EditableModule {
@@ -37,9 +46,13 @@ interface EditableModule {
 async function collectEditableModules(
   srcDir: string,
 ): Promise<ReadonlyArray<EditableModule>> {
-  const skirFiles = await glob(Paths.join(srcDir, "**/*.skir"), {
-    withFileTypes: true,
-  });
+  const skirFiles = (
+    await glob(Paths.join(srcDir, "**/*.skir"), {
+      withFileTypes: true,
+    })
+  ).sort((fileA, fileB) =>
+    compareModulePaths(fileA.fullpath(), fileB.fullpath()),
+  );
   if (skirFiles.length === 0) {
     const isDir = await isDirectory(srcDir);
     if (!isDir) {
