@@ -14,12 +14,16 @@ export async function collectModules(
   cache: ModuleSet | undefined,
   parseMode: "strict" | "lenient",
 ): Promise<ModuleSet> {
-  const modulePathToContent = new Map<string, string>();
-  for (const [modulePath, module] of dependencies.modules) {
-    modulePathToContent.set(modulePath, module.result.sourceCode);
-  }
+  const modulePathToContent = new Map(
+    [...dependencies.modules.entries()].map(([modulePath, module]) => [
+      modulePath,
+      module.result.sourceCode,
+    ]),
+  );
   const editableModules = await collectEditableModules(srcDir);
-  for (const { modulePath, content } of editableModules) {
+  for (const { modulePath, content } of [...editableModules].sort((a, b) =>
+    compareModulePaths(a.modulePath, b.modulePath),
+  )) {
     modulePathToContent.set(modulePath, content);
   }
   return ModuleSet.compile(
@@ -27,6 +31,10 @@ export async function collectModules(
     cache ?? dependencies,
     parseMode,
   );
+}
+
+export function compareModulePaths(pathA: string, pathB: string): number {
+  return pathA < pathB ? -1 : pathA > pathB ? 1 : 0;
 }
 
 interface EditableModule {

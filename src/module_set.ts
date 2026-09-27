@@ -37,6 +37,7 @@ import {
   valueHasPrimitiveType,
 } from "./literals.js";
 import { extractPackagePrefix, parseModule } from "./parser.js";
+import { compareModulePaths } from "./module_collector.js";
 import { ModuleTokens, tokenizeModule } from "./tokenizer.js";
 
 /**
@@ -47,6 +48,8 @@ import { ModuleTokens, tokenizeModule } from "./tokenizer.js";
  * modules that haven't changed since the last compilation.
  */
 export class ModuleSet {
+  static readonly CACHE_FORMAT_VERSION = 1;
+
   static compile(
     modulePathToContent: ReadonlyMap<string, string>,
     cache: ModuleSet | "no-cache",
@@ -84,15 +87,22 @@ export class ModuleSet {
       readonly position: number;
     },
   ) {
+    if (cache.cacheFormatVersion !== ModuleSet.CACHE_FORMAT_VERSION) {
+      throw new Error("Incompatible ModuleSet cache format");
+    }
     this.cache =
       cache !== "no-cache"
-        ? new Cache(modulePathToContent, cache.moduleBundles, cache.registry)
+        ? new Cache(
+            modulePathToContent,
+            cache.moduleBundles,
+            new DeclarationRegistry(cache.registry),
+          )
         : undefined;
     // In completion mode, no need to recompile modules which are not dependencies of
     // the current module.
     const modulePaths = completionMode
       ? [completionMode.modulePath]
-      : modulePathToContent.keys();
+      : [...modulePathToContent.keys()].sort(compareModulePaths);
     for (const modulePath of modulePaths) {
       this.parseAndResolve(modulePath, new Set<string>());
     }
@@ -914,7 +924,10 @@ export class ModuleSet {
     };
     const modules = new Map<string, MutableModuleResult>();
 
-    for (const [modulePath, moduleBundle] of this.moduleBundles) {
+    for (const modulePath of [...this.moduleBundles.keys()].sort(
+      compareModulePaths,
+    )) {
+      const moduleBundle = this.moduleBundles.get(modulePath)!;
       const { module, tokens } = moduleBundle;
       const moduleErrors = tokens.errors.length ? tokens.errors : module.errors;
       modules.set(modulePath, {
@@ -972,10 +985,13 @@ export class ModuleSet {
     // Aggregate errors across all modules.
     const errors: SkirError[] = [];
     const warnings: SkirError[] = [];
-    for (const moduleBundle of modules.values()) {
+    for (const modulePath of [...modules.keys()].sort(compareModulePaths)) {
+      const moduleBundle = modules.get(modulePath)!;
       errors.push(...moduleBundle.errors);
       warnings.push(...moduleBundle.warnings);
     }
+    errors.sort(compareErrors);
+    warnings.sort(compareErrors);
     return {
       modules: modules,
       errors: errors,
@@ -985,6 +1001,7 @@ export class ModuleSet {
 
   // BEGIN PROPERTIES
   private cache: Cache | undefined;
+  private readonly cacheFormatVersion = ModuleSet.CACHE_FORMAT_VERSION;
   private readonly moduleBundles = new Map<string, ModuleBundle>();
   private readonly registry = new DeclarationRegistry();
   private readonly finalizationResult: FinalizationResult;
@@ -1017,6 +1034,22 @@ export class ModuleSet {
   get modules(): ReadonlyMap<string, Result<Module>> {
     return this.finalizationResult.modules;
   }
+}
+
+function compareErrors(errorA: SkirError, errorB: SkirError): number {
+  const byModulePath = compareModulePaths(
+    errorA.token.line.modulePath,
+    errorB.token.line.modulePath,
+  );
+  if (byModulePath !== 0) {
+    return byModulePath;
+  }
+  if (errorA.token.position !== errorB.token.position) {
+    return errorA.token.position - errorB.token.position;
+  }
+  const messageA = errorA.message ?? errorA.expected;
+  const messageB = errorB.message ?? errorB.expected;
+  return messageA < messageB ? -1 : messageA > messageB ? 1 : 0;
 }
 
 /**
@@ -1325,6 +1358,8 @@ type ModuleCacheResult =
     };
 
 class Cache {
+  readonly formatVersion = ModuleSet.CACHE_FORMAT_VERSION;
+
   private readonly modulePathToCacheResult = new Map<
     string,
     ModuleCacheResult
@@ -1387,14 +1422,35 @@ class Cache {
 
 /** Registry of declarations possibly across multiple modules. */
 class DeclarationRegistry {
-  readonly recordMap = new Map<RecordKey, RecordLocation>();
-  readonly numberToRecords = new Map<number, RecordKey[]>();
-  readonly numberToMethods = new Map<number, Method[]>();
+  readonly recordMap: Map<RecordKey, RecordLocation>;
+  readonly numberToRecords: Map<number, RecordKey[]>;
+  readonly numberToMethods: Map<number, Method[]>;
   /**
    * Key: name of a record defined at the top level of a module
    * Value: array of record locations (record name, doc, module path)
    */
-  readonly topLevelNameToRecordLocations = new Map<string, ExpectedName[]>();
+  readonly topLevelNameToRecordLocations: Map<string, ExpectedName[]>;
+
+  constructor(other?: DeclarationRegistry) {
+    this.recordMap = new Map(other?.recordMap);
+    this.numberToRecords = new Map(
+      [...(other?.numberToRecords ?? [])].map(([number, keys]) => [
+        number,
+        [...keys],
+      ]),
+    );
+    this.numberToMethods = new Map(
+      [...(other?.numberToMethods ?? [])].map(([number, methods]) => [
+        number,
+        [...methods],
+      ]),
+    );
+    this.topLevelNameToRecordLocations = new Map(
+      [...(other?.topLevelNameToRecordLocations ?? [])].map(
+        ([name, locations]) => [name, [...locations]],
+      ),
+    );
+  }
 
   mergeFrom(other: DeclarationRegistry): void {
     for (const [key, value] of other.recordMap) {
