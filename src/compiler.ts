@@ -59,9 +59,14 @@ async function makeGeneratorBundle(
 }
 
 interface WriteBatch {
+  readonly version: "skir-write-batch:1";
   /** Key: path to a generated file relative to the skirout dir. */
   readonly pathToFile: ReadonlyMap<string, CodeGenerator.OutputFile>;
   readonly writeTime: Date;
+}
+
+function comparePaths(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 class WatchModeMainLoop {
@@ -135,7 +140,6 @@ class WatchModeMainLoop {
           this.previousModuleSet,
           "strict",
         );
-        this.previousModuleSet = moduleSet;
       } catch (e) {
         if (this.mode === "watch" && e instanceof Error) {
           console.error(makeRed(e.message));
@@ -154,6 +158,7 @@ class WatchModeMainLoop {
           console.error(makeRed("No skir modules found in source directory"));
         }
         await this.doGenerate(moduleSet);
+        this.previousModuleSet = moduleSet;
         if (this.mode === "watch") {
           const date = new Date().toLocaleTimeString("en-US");
           const successMessage = `Generation succeeded at ${date}`;
@@ -191,11 +196,14 @@ class WatchModeMainLoop {
     const pathToFile = new Map<string, CodeGenerator.OutputFile>();
     const pathToGenerator = new Map<string, GeneratorBundle>();
     for (const generator of this.generatorBundles) {
-      const files = generator.generator.generateCode({
-        modules: [...moduleSet.modules.values()].map((r) => r.result),
+      const modules = [...moduleSet.modules.keys()]
+        .sort(comparePaths)
+        .map((modulePath) => moduleSet.modules.get(modulePath)!.result);
+      const files = [...generator.generator.generateCode({
+        modules: modules,
         recordMap: moduleSet.recordMap,
         config: generator.config,
-      }).files;
+      }).files].sort((a, b) => comparePaths(a.path, b.path));
       for (const file of files) {
         const { path } = file;
         if (pathToFile.has(path)) {
@@ -224,7 +232,9 @@ class WatchModeMainLoop {
     // Write or override all the generated files.
     const { lastWriteBatch } = this;
     await Promise.all(
-      Array.from(pathToFile).map(async ([p, newFile]) => {
+      Array.from(pathToFile)
+        .sort(([pathA], [pathB]) => comparePaths(pathA, pathB))
+        .map(async ([p, newFile]) => {
         const oldFile = lastWriteBatch.pathToFile.get(p);
         const generator = pathToGenerator.get(p)!;
         for (const skiroutDir of generator.skiroutDirs) {
@@ -247,7 +257,7 @@ class WatchModeMainLoop {
     // Remove all the pre-existing paths which haven't been overridden.
     await Promise.all(
       Array.from(preExistingAbsolutePaths)
-        .sort((a, b) => b.localeCompare(a, "en-US"))
+        .sort((a, b) => comparePaths(b, a))
         .map(async (p) => {
           try {
             await FileSystem.rm(p, { force: true, recursive: true });
@@ -258,6 +268,7 @@ class WatchModeMainLoop {
     );
 
     this.lastWriteBatch = {
+      version: "skir-write-batch:1",
       pathToFile: pathToFile,
       writeTime: new Date(),
     };
@@ -268,6 +279,7 @@ class WatchModeMainLoop {
   private mustRegenerate = false;
   private previousModuleSet: ModuleSet | undefined;
   private lastWriteBatch: WriteBatch = {
+    version: "skir-write-batch:1",
     pathToFile: new Map(),
     writeTime: new Date(0),
   };
@@ -426,12 +438,14 @@ async function runGeneration(
     skirConfig.generators.map((config) => makeGeneratorBundle(config, root)),
   );
   // Look for duplicates.
-  for (let i = 0; i < generatorBundles.length - 1; ++i) {
-    const { id } = generatorBundles[i]!.generator;
-    if (id === generatorBundles[i + 1]!.generator.id) {
+  const generatorIds = new Set<string>();
+  for (const generatorBundle of generatorBundles) {
+    const { id } = generatorBundle.generator;
+    if (generatorIds.has(id)) {
       console.error(makeRed(`Duplicate generator: ${id}`));
       process.exit(1);
     }
+    generatorIds.add(id);
   }
   // Get dependencies.
   const dependencies = await getDependencies(

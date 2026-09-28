@@ -37,7 +37,13 @@ import {
   valueHasPrimitiveType,
 } from "./literals.js";
 import { extractPackagePrefix, parseModule } from "./parser.js";
-import { ModuleTokens, tokenizeModule } from "./tokenizer.js";
+import {
+  ModuleTokens,
+  normalizeLineEndings,
+  tokenizeModule,
+} from "./tokenizer.js";
+
+const MODULE_SET_CACHE_IDENTITY = "skir-module-set:1";
 
 /**
  * Result of compiling a set of modules. Immutable.
@@ -76,7 +82,7 @@ export class ModuleSet {
   }
 
   constructor(
-    private readonly modulePathToContent: ReadonlyMap<string, string>,
+    modulePathToContent: ReadonlyMap<string, string>,
     cache: ModuleSet | "no-cache",
     private readonly parseMode: "strict" | "lenient",
     private readonly completionMode?: {
@@ -84,15 +90,21 @@ export class ModuleSet {
       readonly position: number;
     },
   ) {
+    this.modulePathToContent = normalizeModuleContent(modulePathToContent);
     this.cache =
       cache !== "no-cache"
-        ? new Cache(modulePathToContent, cache.moduleBundles, cache.registry)
+        ? new Cache(
+            this.modulePathToContent,
+            cache.moduleBundles,
+            cache.registry,
+            parseMode,
+          )
         : undefined;
     // In completion mode, no need to recompile modules which are not dependencies of
     // the current module.
     const modulePaths = completionMode
       ? [completionMode.modulePath]
-      : modulePathToContent.keys();
+      : [...this.modulePathToContent.keys()].sort();
     for (const modulePath of modulePaths) {
       this.parseAndResolve(modulePath, new Set<string>());
     }
@@ -100,6 +112,8 @@ export class ModuleSet {
     // So it can be garbage collected.
     this.cache = undefined;
   }
+
+  private readonly modulePathToContent: ReadonlyMap<string, string>;
 
   private parseAndResolve(
     modulePath: string,
@@ -166,11 +180,16 @@ export class ModuleSet {
       module = parseResult.result;
     }
 
-    const moduleBundle = new ModuleBundle(moduleTokens, {
-      result: module,
-      errors: errors,
-      warnings: warnings,
-    });
+    const moduleBundle = new ModuleBundle(
+      MODULE_SET_CACHE_IDENTITY,
+      this.parseMode,
+      moduleTokens,
+      {
+        result: module,
+        errors: errors,
+        warnings: warnings,
+      },
+    );
 
     // Process all imports.
     for (const declaration of module.declarations) {
@@ -914,7 +933,8 @@ export class ModuleSet {
     };
     const modules = new Map<string, MutableModuleResult>();
 
-    for (const [modulePath, moduleBundle] of this.moduleBundles) {
+    for (const modulePath of [...this.moduleBundles.keys()].sort()) {
+      const moduleBundle = this.moduleBundles.get(modulePath)!;
       const { module, tokens } = moduleBundle;
       const moduleErrors = tokens.errors.length ? tokens.errors : module.errors;
       modules.set(modulePath, {
@@ -922,6 +942,13 @@ export class ModuleSet {
         errors: [...moduleErrors],
         warnings: [...(module.warnings ?? [])],
       });
+    }
+
+    for (const methods of this.registry.numberToMethods.values()) {
+      methods.sort(compareMethods);
+    }
+    for (const records of this.registry.numberToRecords.values()) {
+      records.sort();
     }
 
     // Look for duplicate method numbers.
@@ -972,7 +999,8 @@ export class ModuleSet {
     // Aggregate errors across all modules.
     const errors: SkirError[] = [];
     const warnings: SkirError[] = [];
-    for (const moduleBundle of modules.values()) {
+    for (const modulePath of [...modules.keys()].sort()) {
+      const moduleBundle = modules.get(modulePath)!;
       errors.push(...moduleBundle.errors);
       warnings.push(...moduleBundle.warnings);
     }
@@ -1099,6 +1127,17 @@ function validateKeyedItems(
       });
     }
   }
+}
+
+function compareMethods(a: Method, b: Method): number {
+  return (
+    compareStrings(a.name.line.modulePath, b.name.line.modulePath) ||
+    a.name.position - b.name.position
+  );
+}
+
+function compareStrings(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
 
 class TypeResolver {
@@ -1333,8 +1372,19 @@ class Cache {
   constructor(
     modulePathToNewContent: ReadonlyMap<string, string | ModuleTokens>,
     modulePathToOldBundle: ReadonlyMap<string, ModuleBundle>,
-    readonly registry: DeclarationRegistry,
+    oldRegistry: DeclarationRegistry,
+    private readonly parseMode: "strict" | "lenient",
   ) {
+    this.registry = oldRegistry;
+    const cacheCanBeReused = [...modulePathToOldBundle.values()].every(
+      (bundle) =>
+        bundle.cacheIdentity === MODULE_SET_CACHE_IDENTITY &&
+        bundle.parseMode === parseMode,
+    );
+    if (!cacheCanBeReused) {
+      this.registry = new DeclarationRegistry();
+      return;
+    }
     const unchangedModulePaths = new Set<string>();
     for (const [modulePath, newContent] of modulePathToNewContent) {
       const oldBundle = modulePathToOldBundle.get(modulePath);
@@ -1383,6 +1433,8 @@ class Cache {
   getModuleCacheResult(modulePath: string): ModuleCacheResult {
     return this.modulePathToCacheResult.get(modulePath) ?? { kind: "no-cache" };
   }
+
+  private registry: DeclarationRegistry;
 }
 
 /** Registry of declarations possibly across multiple modules. */
@@ -1461,6 +1513,8 @@ class DeclarationRegistry {
 
 class ModuleBundle {
   constructor(
+    readonly cacheIdentity: string,
+    readonly parseMode: "strict" | "lenient",
     readonly tokens: Result<ModuleTokens>,
     readonly module: Result<Module>,
   ) {}
@@ -1478,6 +1532,16 @@ interface FinalizationResult {
   readonly errors: readonly SkirError[];
   /** Warnings aggregated across all modules. */
   readonly warnings: readonly SkirError[];
+}
+
+function normalizeModuleContent(
+  modulePathToContent: ReadonlyMap<string, string>,
+): ReadonlyMap<string, string> {
+  const normalized = new Map<string, string>();
+  for (const [modulePath, content] of modulePathToContent) {
+    normalized.set(modulePath, normalizeLineEndings(content));
+  }
+  return normalized;
 }
 
 function ensureAllImportsAreUsed(

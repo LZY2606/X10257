@@ -30,6 +30,7 @@ export function tokenizeModule(
     position: number;
   },
 ): Result<ModuleTokens> {
+  sourceCode = normalizeLineEndings(sourceCode);
   const tokens: Token[] = [];
   const errors: SkirError[] = [];
 
@@ -196,6 +197,10 @@ export function tokenizeModule(
     },
     errors: errors,
   };
+}
+
+export function normalizeLineEndings(sourceCode: string): string {
+  return sourceCode.replace(/\r\n?/g, "\n");
 }
 
 function validateWord(token: Token, errors: ErrorSink): boolean {

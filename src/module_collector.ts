@@ -66,7 +66,14 @@ async function collectEditableModules(
       };
     });
 
-  return Promise.all(modules);
+  const editableModules = await Promise.all(modules);
+  return editableModules.sort((a, b) =>
+    a.modulePath < b.modulePath
+      ? -1
+      : a.modulePath > b.modulePath
+        ? 1
+        : 0,
+  );
 }
 
 function validate(relativePath: string): void {
